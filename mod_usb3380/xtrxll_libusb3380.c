@@ -30,7 +30,6 @@
 #include <libusb3380.h>
 
 #include "xtrxll_log.h"
-#include "xtrxll_base.h"
 #include "xtrxll_base_pcie.h"
 #include "xtrxll_libusb3380.h"
 
@@ -40,11 +39,11 @@
 
 #define ASYNC_MODE
 
-#define BUFFERS_RX_MUL 8
+#define BUFFERS_RX_MUL 2
 
 enum {
-	DMA_REGION_TX_ADDR = 0x20000000,  // 256Mb
-	DMA_REGION_RX_ADDR = 0x10000000,  // 256Mb
+	DMA_REGION_TX_ADDR = 0x40000000,  // 512Mb
+	DMA_REGION_RX_ADDR = 0x20000000,  // 512Mb
 };
 
 enum msinterrupts {
@@ -99,9 +98,11 @@ struct xtrxll_usb3380_dev
 	// Input queue
 	uint8_t* rx_queuebuf_ptr; // cache aligned pointer to rx_queuebuf
 	uint8_t* tx_queuebuf_ptr; // cache aligned pointer to tx_queuebuf
+	uint8_t* rx_discard_rxbuffer;
 
-	uint8_t queuebuf[BUFFERS_RX_MUL*2*RXDMA_MMAP_SIZE + TXDMA_MMAP_SIZE + EXTRA_DATA_ALIGMENT];
-	uint8_t discard_rxbuffer[2*RXDMA_MMAP_BUFF + 64];
+	unsigned rx_allocsz;
+	unsigned rx_allocsz_rounded; // rounded buffer to the maximum USB Transfer size
+	//unsigned tx_allocsz;
 
 	// RX part
 	uint32_t rx_buf_max;
@@ -123,6 +124,10 @@ struct xtrxll_usb3380_dev
 	unsigned tx_ep_count;
 	unsigned rx_ep_count;
 	unsigned rx_gpep_buffer_off[MAX_EP_IN_FLY];
+	unsigned rx_gpep_buffer_res[MAX_EP_IN_FLY];
+	uint8_t* rx_res_buffer[MAX_EP_IN_FLY];
+	uint8_t* rx_cur_buffer[MAX_EP_IN_FLY];
+
 	bool rx_gpep_active[MAX_EP_IN_FLY];
 
 	bool rx_buf_to;
@@ -273,6 +278,10 @@ static int xtrxllusb3380_wait_msi(struct xtrxll_usb3380_dev* dev, enum msinterru
 	} else {
 		res = sem_trywait(&dev->interrupts[i]);
 	}
+	if (res) {
+		// sem_* function on error returns -1, get proper error
+		res = -errno;
+	}
 	return res;
 }
 
@@ -295,8 +304,11 @@ static int xtrxllusb3380v0_lms7_spi_bulk(struct xtrxll_base_dev* bdev,
 		}
 
 		res = xtrxllusb3380_wait_msi(dev, MSINT_SPI, TO_SPI);
-		if (res)
+		if (res) {
+			XTRXLLS_LOG("USB3", XTRXLL_ERROR, "%s: SPI MSI wait timed out!\n",
+						dev->base.id);
 			return res;
+		}
 
 		if ((out[i] & (1U<<31)) == 0) {
 			res = internal_xtrxll_transact_spi_rb(dev, &in[i]);
@@ -322,8 +334,12 @@ static int xtrxllusb3380v0_i2c_cmd(struct xtrxll_base_dev* bdev,
 
 	if (out) {
 		res = xtrxllusb3380_wait_msi(dev, MSINT_I2C, TO_I2C);
-		if (res)
+		if (res) {
+			XTRXLLS_LOG("USB3", XTRXLL_ERROR, "%s: I2C MSI wait timed out!\n",
+						dev->base.id);
 			return res;
+		}
+
 		res = pcieusb3380v0_reg_in(dev, UL_GP_ADDR + GP_PORT_RD_TMP102, out);
 	}
 	return res;
@@ -374,6 +390,41 @@ static void xtrxllusb3380v0_log(libusb3380_loglevel_t level,
 	va_end(ap);
 }
 
+static libusb_device * find_usb_match(libusb_device **usbdev, size_t devices,
+									  int usb_bus, int usb_port, int usb_addr,
+									  unsigned* devid, char* devid_s, size_t devid_s_sz)
+{
+	struct libusb_device_descriptor desc;
+	int res;
+	for (unsigned i = 0; i < devices; i++) {
+		res = libusb_get_device_descriptor(usbdev[i], &desc);
+		if (res)
+			continue;
+
+		if (desc.idProduct != LIBUSB3380_PID || desc.idVendor != LIBUSB3380_VID)
+			continue;
+
+		uint8_t bus = libusb_get_bus_number(usbdev[i]);
+		uint8_t port = libusb_get_port_number(usbdev[i]);
+		uint8_t addr = libusb_get_device_address(usbdev[i]);
+
+		*devid = (unsigned)bus * 1000000 + (unsigned)port * 1000 + addr;
+		snprintf(devid_s, devid_s_sz, "%d/%d/%d", bus, port, addr);
+
+		XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "usb3380: comparing devices %d/%d/%d <> %d/%d/%d\n",
+					usb_bus, usb_port, usb_addr,
+					bus, port, addr);
+
+		if ((usb_addr == -1 && usb_bus == -1 && usb_port == -1) ||
+				(usb_addr == -1 && usb_bus == -1 && usb_port == port) ||
+				(usb_addr == -1 && usb_bus == bus && usb_port == port) ||
+				(usb_bus == bus && usb_port == port && usb_addr == addr)) {
+			return usbdev[i];
+		}
+	}
+	return NULL;
+}
+
 static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 								struct xtrxll_base_dev** pdev)
 {
@@ -385,83 +436,64 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 	unsigned devid;
 	char devid_s[16];
 
+	int usb_bus = -1;
+	int usb_port = -1;
+	int usb_addr = -1;
+	int usb_speed = 0;
+
 	usb3380_set_logfunc(xtrxllusb3380v0_log, NULL);
 	usb3380_set_loglevel(xtrxll_get_loglevel());
 
-	if (device == NULL || strcmp(device, "usb3380") == 0) {
-		devid = 1;
-		devid_s[0] = '1';
-		devid_s[1] = 0;
-		res = usb3380_context_init(&ctx);
-	} else {
-		if (strncmp(device, "usb3380://", 10)) {
-			return -EINVAL;
-		}
-
-		int usb_bus;
-		int usb_port;
-		int usb_addr;
-
+	if (device && (device[0] != 0)) {
 		int cnt = sscanf(device, "usb3380://%d/%d/%d", &usb_bus, &usb_port, &usb_addr);
 		if (cnt < 3) {
 			cnt = sscanf(device, "usb3380://%d/%d", &usb_bus, &usb_port);
 			if (cnt < 2) {
-				XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Can't parse device string!\n");
-				return -EINVAL;
-			}
-			usb_addr = -1;
-		}
-
-		libusb_context *uctx;
-		if (libusb_init(&uctx)) {
-			return -EFAULT;
-		}
-
-		struct libusb_device_descriptor desc;
-		libusb_device **dev;
-		libusb_device *match = NULL;
-		ssize_t devices = libusb_get_device_list(uctx, &dev);
-		if (devices < 0) {
-			libusb_exit(uctx);
-			return -ENODEV;
-		}
-
-		for (int i = 0; i < devices; i++) {
-			res = libusb_get_device_descriptor(dev[i], &desc);
-			if (res)
-				continue;
-
-			if (desc.idProduct != LIBUSB3380_PID || desc.idVendor != LIBUSB3380_VID)
-				continue;
-
-			uint8_t bus = libusb_get_bus_number(dev[i]);
-			uint8_t port = libusb_get_port_number(dev[i]);
-			uint8_t addr = libusb_get_device_address(dev[i]);
-
-			devid = (unsigned)bus * 1000000 + (unsigned)port * 1000 + addr;
-			snprintf(devid_s, sizeof(devid_s), "%d/%d/%d", bus, port, addr);
-
-
-			XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "usb3380: comparing devices %d/%d/%d <> %d/%d/%d\n",
-					   usb_bus, usb_port, usb_addr,
-					   bus, port, addr);
-
-			if ((usb_addr == -1 && usb_bus == bus && usb_port == port) ||
-					(usb_bus == bus && usb_port == port && usb_addr == addr)) {
-				match = dev[i];
-				break;
+				cnt = sscanf(device, "usb3380://%d", &usb_bus);
+				if (cnt < 1) {
+					if (strcmp(device, "usb3380")) {
+						XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Can't parse device string!\n");
+						return -EINVAL;
+					}
+				}
 			}
 		}
-
-		if (match) {
-			res = usb3380_context_init_ex(&ctx, match, uctx);
-		} else {
-			res = -ENODEV;
-		}
-		libusb_free_device_list(dev, 1);
 	}
+
+	libusb_context *uctx;
+	if (libusb_init(&uctx)) {
+		return -EFAULT;
+	}
+	libusb_device **usbdev;
+	ssize_t devices = libusb_get_device_list(uctx, &usbdev);
+	if (devices < 0) {
+		libusb_exit(uctx);
+		return -ENODEV;
+	}
+	libusb_device *match = find_usb_match(usbdev, devices,
+										  usb_bus, usb_port, usb_addr,
+										  &devid, devid_s, sizeof(devid_s));
+	if (match == NULL) {
+		XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "No USB device was found to match %d/%d/%d\n",
+					usb_bus, usb_port, usb_addr);
+		libusb_exit(uctx);
+		return -ENODEV;
+	}
+
+	int speed = libusb_get_device_speed(match);
+	switch (speed) {
+	case LIBUSB_SPEED_LOW: usb_speed = 1; break;
+	case LIBUSB_SPEED_FULL: usb_speed = 12; break;
+	case LIBUSB_SPEED_HIGH: usb_speed = 480; break;
+	case LIBUSB_SPEED_SUPER: usb_speed = 5000; break;
+	}
+	bool int_polling = (speed < LIBUSB_SPEED_SUPER);
+
+	res = usb3380_context_init_ex(&ctx, match, uctx);
+	libusb_free_device_list(usbdev, 1);
 	if (res) {
 		XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Unable to allocate USB3380 context: error: %d\n", res);
+		libusb_exit(uctx);
 		return res;
 	}
 
@@ -501,7 +533,7 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 	cfg.bar2.flags = 0;
 	// USB IN <- PCIe RX
 	cfg.bar3.addr = DMA_REGION_RX_ADDR;
-	cfg.bar3.length = BAR_2M;
+	cfg.bar3.length = BAR_512M;
 	for (unsigned i = 0; i < 4; i++) {
 		cfg.bar3.qadrants_ep_map[i] = (i >= 2 && dual_ep) ? LIBUSB3380_GPEP2 : LIBUSB3380_GPEP0;
 		cfg.bar3.gpep_in_type[i] = true;
@@ -521,20 +553,46 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 
 	res = usb3380_init_root_complex(ctx, &cfg);
 	if (res) {
-		if (res == -EAGAIN) {
+		if (res == -EAGAIN && int_polling) {
+			// Hack
+			libusb_reset_device(*(libusb_device_handle**)ctx);
+
 			usb3380_context_free(ctx);
 
-			res = usb3380_context_init(&ctx);
+			// Reinitialization takes time, wait 0.5sec
+			usleep(500000);
+
+			// Repeat reinitialization with the same usb_bus and usb_port,
+			// addr will differ after usb reset
+			if (libusb_init(&uctx)) {
+				return -EFAULT;
+			}
+			devices = libusb_get_device_list(uctx, &usbdev);
+			if (devices < 0) {
+				libusb_exit(uctx);
+				return -ENODEV;
+			}
+			match = find_usb_match(usbdev, devices, usb_bus, usb_port, -1,
+								   &devid, devid_s, sizeof(devid_s));
+			if (match == NULL) {
+				libusb_exit(uctx);
+				return -ENODEV;
+			}
+
+			res = usb3380_context_init_ex(&ctx, match, uctx);
+			libusb_free_device_list(usbdev, 1);
 			if (res) {
-				XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Unable to reinitialize context: error: %d\n", res);
+				XTRXLLS_LOG("USB3", XTRXLL_ERROR,
+							"Unable to reinitialize context: error: %d\n", res);
 				return res;
 			}
 
 			res = usb3380_init_root_complex(ctx, &cfg);
-		}
-		if (res) {
-			XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Unable to intialize USB3380 Root Complex mode: error: %d\n", res);
-			goto usbinit_fail;
+			if (res) {
+				XTRXLLS_LOG("USB3", XTRXLL_ERROR,
+							"Unable to intialize USB3380 Root Complex mode: error: %d\n", res);
+				goto usbinit_fail;
+			}
 		}
 	}
 
@@ -574,8 +632,13 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 				   dev->base.id);
 		goto failed_mutex_ctrl;
 	}
-	dev->rx_queuebuf_ptr = (uint8_t*)((uintptr_t)(dev->queuebuf + EXTRA_DATA_ALIGMENT - 1) & ~((uintptr_t)(EXTRA_DATA_ALIGMENT - 1)));
-	dev->tx_queuebuf_ptr = dev->rx_queuebuf_ptr + BUFFERS_RX_MUL*2*RXDMA_MMAP_SIZE;
+	dev->rx_queuebuf_ptr = NULL;
+	dev->tx_queuebuf_ptr = NULL;
+	dev->rx_discard_rxbuffer = NULL;
+
+	dev->rx_allocsz = 0;
+	dev->rx_allocsz_rounded = 0;
+	//dev->tx_allocsz = 0;
 
 	dev->rx_running = false;
 	dev->rx_stop = false;
@@ -635,6 +698,10 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 	dev->rx_ep_count = (dual_ep) ? 2 : 1;
 	dev->rx_gpep_buffer_off[0] = 0;
 	dev->rx_gpep_buffer_off[1] = 0;
+	dev->rx_gpep_buffer_res[0] = 0;
+	dev->rx_gpep_buffer_res[1] = 0;
+	dev->rx_res_buffer[0] = NULL;
+	dev->rx_res_buffer[1] = NULL;
 	dev->rx_gpep_active[0] = false;
 	dev->rx_gpep_active[1] = false;
 
@@ -667,8 +734,7 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 		goto failed_pcie_cfg;
 	}
 
-	res = xtrxllpciebase_dma_start(&dev->pcie, 0, XTRXLL_FE_STOP, XTRXLL_FE_MODE_MIMO,
-									0, XTRXLL_FE_STOP, XTRXLL_FE_MODE_MIMO);
+	res = xtrxllpciebase_dma_start(&dev->pcie, 0, NULL);
 	if (res) {
 		goto failed_pcie_cfg;
 	}
@@ -684,8 +750,8 @@ static int xtrxllusb3380v0_open(const char* device, unsigned flags,
 		goto failed_pcie_cfg;
 	}
 
-	XTRXLLS_LOG("USB3", XTRXLL_INFO,  "%s: Device `%s` was opened\n",
-			   dev->base.id, device);
+	XTRXLLS_LOG("USB3", XTRXLL_INFO,  "%s: Device `%s` was opened (%d Mbit)\n",
+			   dev->base.id, devid_s, usb_speed);
 	return 0;
 
 failed_unsup_hw:
@@ -730,6 +796,8 @@ static void xtrxllusb3380v0_close(struct xtrxll_base_dev* bdev)
 	for (unsigned i = 0; i < MSINT_COUNT; i++) {
 		sem_destroy(&dev->interrupts[i]);
 	}
+	free(dev->rx_queuebuf_ptr);
+	free(dev->tx_queuebuf_ptr);
 	free(dev);
 }
 
@@ -797,6 +865,10 @@ failed_get_list:
 	return res;
 }
 
+enum {
+	MAX_BULK_PAYLOAD_SIZE = 1024,
+};
+
 static int xtrxllusb3380v0_dma_rx_init(struct xtrxll_base_dev* bdev, int chan,
 									   unsigned buf_szs, unsigned* out_szs)
 {
@@ -807,28 +879,47 @@ static int xtrxllusb3380v0_dma_rx_init(struct xtrxll_base_dev* bdev, int chan,
 	if (chan != 0)
 		return -EINVAL;
 
-	// Virtual USB3380 PCIe DMA memory
-	if (buf_szs % 16 || buf_szs > 2 * RXDMA_MMAP_BUFF) {
-		XTRXLLS_LOG("USB3", XTRXLL_ERROR, "Wire RX pkt size is %d, should be rounded to 128 bit and less %d\n",
-				   buf_szs, 2*RXDMA_MMAP_BUFF);
-		return -EINVAL;
-	} else if (buf_szs == 0) {
-		buf_szs = 2 * RXDMA_MMAP_BUFF;
+	int allocsz = xtrxllpciebase_dmarx_bufsz(&dev->pcie, buf_szs);
+	if (allocsz < 0)
+		return allocsz;
+
+	if (dev->rx_allocsz < allocsz) {
+		free(dev->rx_queuebuf_ptr);
+		dev->rx_allocsz = allocsz;
+
+		// Round up to maximum transfer in Bulk and reserve one more transfer in the case
+		dev->rx_allocsz_rounded = (allocsz % 1024) ? allocsz + (2048 - (allocsz % 1024)) : allocsz;
+
+		res = posix_memalign((void**)&dev->rx_queuebuf_ptr, 4096,
+							 dev->rx_allocsz_rounded * (dev->rx_buf_max + 1));
+		if (res != 0)
+			return -res;
+
+		dev->rx_discard_rxbuffer = dev->rx_queuebuf_ptr + dev->rx_buf_max * dev->rx_allocsz_rounded;
+	}
+	if (buf_szs == 0) {
+		buf_szs = allocsz;
 	}
 
 	for (i = 0; i < RXDMA_BUFFERS; i++) {
-		int num = (i % 2) ? RXDMA_BUFFERS / 2 + i / 2 : i / 2;
+		uint32_t off = DMA_REGION_RX_ADDR + ((i % 2) ? 256 * 1024 * 1024 : 0);
 		uint32_t reg = (((buf_szs / 16) - 1) & 0xFFF) |
-				(0xFFFFF000 & (DMA_REGION_RX_ADDR + num * 2 * RXDMA_MMAP_BUFF));
+				(0xFFFFF000 & (off + (i / 2) * dev->rx_allocsz_rounded));
 
 		res = pcieusb3380v0_reg_out(dev, UL_RXDMA_ADDR + i, reg);
 		if (res)
 			return res;
 	}
 
-	dev->pcie.cfg_rx_desired_bufsize = buf_szs;
-	dev->pcie.cfg_rx_bufsize = buf_szs & ~15U;
+	if ((GET_HWID_COMPAT(dev->base.hwid) == 1)) {
+		uint32_t pktsz = (unsigned)((buf_szs / 16) - 1) | (1U << 31);
 
+		res = pcieusb3380v0_reg_out(dev, UL_RXDMA_ADDR + 32, pktsz);
+		if (res)
+			return res;
+	}
+
+	dev->pcie.cfg_rx_bufsize = buf_szs;
 	*out_szs = dev->pcie.cfg_rx_bufsize;
 	return 0;
 }
@@ -857,6 +948,7 @@ static void xtrxllusb3380v0_dma_rx_gpep_cb(const struct libusb3380_qgpep* gpep,
 	struct xtrxll_usb3380_dev* dev = (struct xtrxll_usb3380_dev*)gpep->param;
 	int res;
 	bool packet_discarded = dev->rx_discard;
+	unsigned residual = 0;
 
 	if (gpep->base.status != DQS_SUCCESS) {
 		if (dev->rx_stop) {
@@ -871,15 +963,25 @@ static void xtrxllusb3380v0_dma_rx_gpep_cb(const struct libusb3380_qgpep* gpep,
 			return;
 		}
 
-		XTRXLLS_LOG("USB3", XTRXLL_WARNING, "%s: GPEP idx %d status: %d (witten %d)\n",
-				   dev->base.id, ep_idx, gpep->base.status, gpep->base.written);
+		XTRXLLS_LOG("USB3", XTRXLL_WARNING, "%s: GPEP idx %d status: %d (witten %d, res %d)\n",
+					dev->base.id, ep_idx, gpep->base.status, gpep->base.written,
+					dev->rx_gpep_buffer_off[ep_idx] + gpep->base.written - dev->pcie.cfg_rx_bufsize);
 
+		if ((gpep->base.status == DQS_ABORT) ||
+			(gpep->base.status == DQS_CANCELLED)) {
+			// TODO: FIXME
+			return;
+		}
+
+		if (dev->rx_gpep_buffer_off[ep_idx] < dev->pcie.cfg_rx_bufsize) {
+			res = xtrxllusb3380v0_dma_rx_gpep_issue(dev, 1U << ep_idx);
+			assert(res == 0); // TODO check error code
+			return;
+		}
+	} else {
 		dev->rx_gpep_buffer_off[ep_idx] += gpep->base.written;
-
-		res = xtrxllusb3380v0_dma_rx_gpep_issue(dev, 1U << ep_idx);
-		assert(res == 0); // TODO check error code
-		return;
 	}
+	residual = dev->rx_gpep_buffer_off[ep_idx] - dev->pcie.cfg_rx_bufsize;
 
 	if (packet_discarded) {
 		XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: DISGARDED PACKET\n", dev->base.id);
@@ -889,6 +991,14 @@ static void xtrxllusb3380v0_dma_rx_gpep_cb(const struct libusb3380_qgpep* gpep,
 	if (!packet_discarded && ep_idx == 0) {
 		dev->pcie.rd_buf_idx += dev->rx_ep_count;
 	}
+	if (residual) {
+		dev->rx_res_buffer[ep_idx] = dev->rx_cur_buffer[ep_idx];
+		dev->rx_gpep_buffer_res[ep_idx] = residual;
+	} else {
+		dev->rx_res_buffer[ep_idx] = NULL;
+		dev->rx_gpep_buffer_res[ep_idx] = 0;
+	}
+
 	dev->rx_gpep_buffer_off[ep_idx] = 0;
 
 	if (!dev->rx_stop) {
@@ -945,14 +1055,31 @@ static int xtrxllusb3380v0_dma_rx_gpep_issue(struct xtrxll_usb3380_dev* dev,
 		assert(dev->pcie.cfg_rx_bufsize > dev->rx_gpep_buffer_off[i]);
 
 		if (ep_mask & (1U << i)) {
-			buffer = (dev->rx_discard) ? dev->discard_rxbuffer :
-										 dev->rx_queuebuf_ptr + ((dev->pcie.rd_buf_idx + i) & (dev->rx_buf_max-1)) * 2 * RXDMA_MMAP_BUFF;
+			buffer = (dev->rx_discard) ? dev->rx_discard_rxbuffer :
+										 dev->rx_queuebuf_ptr + ((dev->pcie.rd_buf_idx + i) & (dev->rx_buf_max-1)) * dev->rx_allocsz_rounded;
 			dev->rx_gpep_active[i] = true;
+			dev->rx_cur_buffer[i] = buffer;
+			if (dev->rx_gpep_buffer_res[i]) {
+				assert(dev->rx_gpep_buffer_off[i] == 0);
+				memcpy(buffer, dev->rx_res_buffer[i], dev->rx_gpep_buffer_res[i]);
+				dev->rx_gpep_buffer_off[i] = dev->rx_gpep_buffer_res[i];
+
+				dev->rx_gpep_buffer_res[i] = 0;
+				dev->rx_res_buffer[i] = 0;
+			}
+			unsigned post_sz = dev->pcie.cfg_rx_bufsize - dev->rx_gpep_buffer_off[i];
+
+			// Always request number of MAX_BULK_PAYLOAD_SIZE to get rid of overflow error
+			if (post_sz % MAX_BULK_PAYLOAD_SIZE)
+				post_sz += MAX_BULK_PAYLOAD_SIZE - (post_sz % MAX_BULK_PAYLOAD_SIZE);
+
+			XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "off=%d post_sz=%d\n", dev->rx_gpep_buffer_off[i], post_sz);
+
 			res = usb3380_async_gpep_in_post(dev->mgr,
 											 gpep_map[i],
 											 0,
 											 buffer + dev->rx_gpep_buffer_off[i],
-											 dev->pcie.cfg_rx_bufsize - dev->rx_gpep_buffer_off[i],
+											 post_sz,
 											 xtrxllusb3380v0_dma_rx_gpep_cb,
 											 dev);
 			if (res)
@@ -1023,10 +1150,12 @@ static int xtrxllusb3380v0_dma_rx_getnext(struct xtrxll_base_dev* bdev,
 			res = xtrxllpciebase_dmarx_get(&dev->pcie, chan, &bn, &cwts, sz,
 										   (dev->rx_dma_flow_ctrl) ? PCIEDMARX_NO_CNTR_UPD : PCIEDMARX_NO_CNTR_CHECK, 0);
 			if (res == 0) {
-				XTRXLLS_LOG("USB3", XTRXLL_WARNING, "%s: RX DATA BUT NOT BUF\n", dev->base.id);
+				XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: RX DATA BUT NOT BUF\n", dev->base.id);
 				continue;
 			} else if (res == -EOVERFLOW) {
-				XTRXLLS_LOG("USB3", XTRXLL_WARNING, "%s: RX OVERFLOW\n", dev->base.id);
+				XTRXLLS_LOG("USB3", XTRXLL_WARNING, "%s: RX OVERFLOW off=[%d;%d] res=[%d;%d]\n",
+							dev->base.id, dev->rx_gpep_buffer_off[0], dev->rx_gpep_buffer_off[1],
+							dev->rx_gpep_buffer_res[0], dev->rx_gpep_buffer_res[1]);
 				cwts += dev->pcie.cfg_rx_bufsize;
 				dev->pcie.rd_cur_sample = cwts;
 				if (*wts) {
@@ -1057,7 +1186,7 @@ static int xtrxllusb3380v0_dma_rx_getnext(struct xtrxll_base_dev* bdev,
 	unsigned bufno = (dev->rx_bufno_consumed++) & (dev->rx_buf_max - 1);
 
 	*sz = dev->pcie.cfg_rx_bufsize;
-	*addr = dev->rx_queuebuf_ptr + bufno * 2 * RXDMA_MMAP_BUFF;
+	*addr = dev->rx_queuebuf_ptr + bufno * dev->rx_allocsz_rounded;
 
 	if (wts) {
 		*wts = dev->pcie.rd_cur_sample;
@@ -1077,11 +1206,13 @@ static int xtrxllusb3380v0_dma_rx_release(struct xtrxll_base_dev* bdev,
 	struct xtrxll_usb3380_dev* dev = (struct xtrxll_usb3380_dev*)bdev;
 	int res = 0;
 
-	if (chan != 0)
+	if (chan != 0 || dev->pcie.cfg_rx_bufsize == 0 || dev->rx_allocsz_rounded == 0)
 		return -EINVAL;
 
-	unsigned bufno = ((uint8_t*)addr - dev->rx_queuebuf_ptr) / (2 * RXDMA_MMAP_BUFF);
-	assert(bufno < dev->rx_buf_max);
+	unsigned bufno = ((uint8_t*)addr - dev->rx_queuebuf_ptr) / dev->rx_allocsz_rounded;
+	unsigned bufoff = ((uint8_t*)addr - dev->rx_queuebuf_ptr) % dev->rx_allocsz_rounded;
+	if (bufno >= dev->rx_buf_max || bufoff)
+		return -EINVAL;
 
 	unsigned buffs_available =  __atomic_add_fetch(&dev->rx_buf_available, 1, __ATOMIC_SEQ_CST);
 	if (buffs_available == 1 && !dev->rx_stop) {
@@ -1102,15 +1233,24 @@ static int xtrxllusb3380v0_dma_tx_init(struct xtrxll_base_dev* bdev, int chan,
 									   unsigned buf_szs)
 {
 	struct xtrxll_usb3380_dev* dev = (struct xtrxll_usb3380_dev*)bdev;
+	int res;
 
 	if (chan != 0)
 		return -EINVAL;
 
-	int res;
+	unsigned allocsz = xtrxllpciebase_dmatx_bufsz(&dev->pcie, buf_szs);
+	if (allocsz < 0)
+		return allocsz;
+
+	if (dev->tx_queuebuf_ptr == 0) {
+		res = posix_memalign((void**)&dev->tx_queuebuf_ptr, 4096, TXDMA_MMAP_BUFF * TXDMA_BUFFERS);
+		if (res != 0)
+			return -res;
+	}
+
 	unsigned i;
 	for (i = 0; i < TXDMA_BUFFERS; i++) {
-        int num = (dev->tx_ep_count == 1) ? i :
-                (i % 2) ? TXDMA_BUFFERS / 2 + i / 2 : i / 2;
+		int num = (i % 2) ? TXDMA_BUFFERS / 2 + i / 2 : i / 2;
 
 		uint32_t reg = (((buf_szs / 16) - 1) & 0xFFF) |
 				(0xFFFFF000 & (DMA_REGION_TX_ADDR + /*i*/ num * TXDMA_MMAP_BUFF));
@@ -1141,8 +1281,8 @@ static void xtrxllusb3380v0_dma_tx_gpepx_cb(const struct libusb3380_qgpep* gpep,
 	int res;
 	uint32_t fly = __atomic_and_fetch(&dev->tx_fly_buffers, ~(1U << idx), __ATOMIC_SEQ_CST);
 
-	XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: WRITE DONE %d idx %d (%08x)\n",
-			   dev->base.id, gpepno, idx, fly);
+	XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: WRITE DONE %d idx %d (%08x) written: %d\n",
+			   dev->base.id, gpepno, idx, fly, gpep->base.written);
 
 	res = sem_post(&dev->tx_buf_available);
 	assert(res == 0); 
@@ -1166,17 +1306,17 @@ static int xtrxllusb3380v0_dma_tx_gpep_issue(struct xtrxll_usb3380_dev* dev, uns
 	unsigned length = dev->tx_post_size[idx & 0x1f];
 	int res;
 
-	XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: TX send idx %d\n", dev->base.id, idx);
+	XTRXLLS_LOG("USB3", XTRXLL_DEBUG, "%s: TX send idx %d length %d\n", dev->base.id, idx, length);
 
 	libusb3380_gpep_t gp = (dev->tx_ep_count == 1) ? LIBUSB3380_GPEP2 :
 						(((idx % 2) == 0) ? LIBUSB3380_GPEP0 : LIBUSB3380_GPEP2);
 	res = usb3380_async_gpep_out_post(dev->mgr,
-								gp,
-								idx & 0x1f,
-								buffer,
-								length,
-								xtrxllusb3380v0_dma_tx_gpepx_cb,
-								dev);
+									  gp,
+									  idx & 0x1f,
+									  buffer,
+									  length,
+									  xtrxllusb3380v0_dma_tx_gpepx_cb,
+									  dev);
 	return res;
 }
 
@@ -1187,13 +1327,13 @@ static int xtrxllusb3380v0_dma_tx_getfree_ex(struct xtrxll_base_dev* bdev,
 	struct xtrxll_usb3380_dev* dev = (struct xtrxll_usb3380_dev*)bdev;
 	int res;
 	int ilate = 0;
-	unsigned bufno = TXDMA_MMAP_BUFF; // should not happed
+	unsigned bufno = TXDMA_BUFFERS; // should not happed
 
 	if (chan != 0)
 		return -EINVAL;
 
 	if (addr == NULL) {
-		res = xtrxllpciebase_dmatx_get(&dev->pcie, chan, NULL, &ilate, false);
+		res = xtrxllpciebase_dmatx_get(&dev->pcie, chan, NULL, &ilate, true);
 		if (late) {
 			*late = ilate;
 		}
@@ -1252,9 +1392,11 @@ static int xtrxllusb3380v0_dma_tx_getfree_ex(struct xtrxll_base_dev* bdev,
 		if (!bufno_obtained) {
 			res = xtrxllpciebase_dmatx_get(&dev->pcie, chan, &bufno, &ilate, false);
 			if (res == -EBUSY) {
-				XTRXLLS_LOG("USB3", XTRXLL_WARNING,  "%s: TX BUSY\n", dev->base.id);
+				XTRXLLS_LOG("USB3", XTRXLL_DEBUG,  "%s: TX BUSY\n", dev->base.id);
 
-				xtrxllpciebase_dmatx_get(&dev->pcie, chan, NULL, &ilate, false);
+				if (xtrxll_get_loglevel() >= XTRXLL_INFO_LMS) {
+					xtrxllpciebase_dmatx_get(&dev->pcie, chan, NULL, &ilate, true);
+				}
 			} else if (res == 0) {
 				assert(bufno == (dev->tx_bufno_posted & 0x1f));
 				dev->tx_bufno_posted++;
@@ -1270,6 +1412,7 @@ static int xtrxllusb3380v0_dma_tx_getfree_ex(struct xtrxll_base_dev* bdev,
 		*late = ilate;
 	}
 	if (addr) {
+		assert(bufno < TXDMA_BUFFERS);
 		*addr = (void*)((char*)dev->tx_queuebuf_ptr + TXDMA_MMAP_BUFF * bufno);
 	}
 
@@ -1368,21 +1511,21 @@ static void xtrxllusb3380v0_flush_dma_tx(struct xtrxll_usb3380_dev* dev)
 }
 
 static int xtrxllusb3380v0_dma_start(struct xtrxll_base_dev* bdev, int chan,
-									 xtrxll_fe_t rxfe, xtrxll_mode_t rxmode,
-									 wts_long_t rx_start_sample,
-									 xtrxll_fe_t txfe, xtrxll_mode_t txmode)
+									 const struct xtrxll_dmaop* op)
 {
 	struct xtrxll_usb3380_dev* dev = (struct xtrxll_usb3380_dev*)bdev;
-	dev->tx_chans = (txmode == XTRXLL_FE_MODE_MIMO) ? 2 : 1;
+	dev->tx_chans = (op) ? ((op->txmode == XTRXLL_FE_MODE_MIMO) ? 2 : 1) : 2;
 
 	int res;
+	xtrxll_fe_t rxfe = (op) ? op->rxfe : XTRXLL_FE_STOP;
+	xtrxll_fe_t txfe = (op) ? op->txfe : XTRXLL_FE_STOP;
 
 	if (rxfe == XTRXLL_FE_STOP) {
 		dev->rx_stop = true;
 		xtrxllpciebase_dmarx_stat(&dev->pcie);
 
 		res = pcieusb3380v0_reg_out(dev, UL_GP_ADDR + GP_PORT_WR_RXTXDMA,
-									(1UL << GP_PORT_WR_RXTXDMA_RXV) | (rxfe << GP_PORT_WR_RXTXDMA_RXOFF));
+									(1UL << GP_PORT_WR_RXTXDMA_RXV) | ((unsigned)rxfe << GP_PORT_WR_RXTXDMA_RXOFF));
 
 		while (dev->rx_gpep_active[0] || dev->rx_gpep_active[1]) {
 			usleep(1000);
@@ -1397,7 +1540,7 @@ static int xtrxllusb3380v0_dma_start(struct xtrxll_base_dev* bdev, int chan,
 
 	if (txfe == XTRXLL_FE_STOP) {
 		dev->tx_stop = true;
-		xtrxllpciebase_dmatx_get(&dev->pcie, 0, NULL, NULL, false);
+		//xtrxllpciebase_dmatx_get(&dev->pcie, 0, NULL, NULL, false);
 	} else if (txfe != XTRXLL_FE_DONTTOUCH) {
 		dev->tx_stop = false;
 		//dev->tx_buf_available = TXDMA_BUFFERS;
@@ -1409,8 +1552,7 @@ static int xtrxllusb3380v0_dma_start(struct xtrxll_base_dev* bdev, int chan,
 	}
 
 
-	res = xtrxllpciebase_dma_start(&dev->pcie, chan, rxfe, rxmode,
-									rx_start_sample, txfe, txmode);
+	res = xtrxllpciebase_dma_start(&dev->pcie, chan, op);
 	if (rxfe == XTRXLL_FE_STOP) {
 		while (dev->rx_gpep_active[0] || dev->rx_gpep_active[1]) {
 			struct timespec ts;
@@ -1465,7 +1607,7 @@ static int xtrxllusb3380v0_get_sensor(struct xtrxll_base_dev* bdev,
 }
 
 static int xtrxllusb3380v0_set_param(struct xtrxll_base_dev* dev,
-									  unsigned paramno, unsigned val)
+									  unsigned paramno, uintptr_t val)
 {
 	return dev->ctrlops->set_param(dev->self, paramno, val);
 }

@@ -386,6 +386,232 @@ void do_test_1pps(struct xtrxll_dev *dev, int initial_dac, double fref)
 	}
 }
 
+void do_ledtest(struct xtrxll_dev *dev, int testno)
+{
+	int res;
+
+	//res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_FUNC, (1 << 8) | (1 << 10) | (1 << 12));
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_FUNC, 0);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_DIR, 7 << 4);
+	if (res)
+		return;
+
+	for (unsigned i = 0; i < 64; i++) {
+		res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_OUT, i << 4);
+		if (res)
+			return;
+
+		usleep(250000);
+	}
+}
+
+void do_synctest(struct xtrxll_dev *dev, bool internal)
+{
+	int res;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_RESET, 1);
+	if (res)
+		return;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_FUNC, (1 << 0) | (1 << 2) | (1 << 22));
+	if (res)
+		return;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_DIR, 7 << 4);
+	if (res)
+		return;
+
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_PPSDO_CTRL, XTRXLL_PPSDO_DISABLE);
+	if (res)
+		return;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_CTRL, XTRXLL_GTIME_DISABLE);
+	if (res)
+		return;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_ISOPPS_CTRL, XTRXLL_GISO_DISABLE);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_RESET, 0);
+	if (res)
+		return;
+
+	struct xtrxll_gtime_cmd cc;
+	cc.type = XTRXLL_GCMDT_GPIO_SET;
+	cc.cmd_idx = 0;
+	cc.param = 7 << 4;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_LOAD_CMD, (uintptr_t)&cc);
+	if (res)
+		return;
+
+	cc.type = XTRXLL_GCMDT_GPIO_SET;
+	cc.cmd_idx = 1;
+	cc.param = 0;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_LOAD_CMD, (uintptr_t)&cc);
+	if (res)
+		return;
+
+	struct xtrxll_gtime_time dd;
+	for (unsigned i = 0; i < 16; i++) {
+		dd.d_idx = 0;
+		dd.d_cnt = 1;
+		dd.frac = 0;
+		dd.sec = 4100 + 2 * i;
+		res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_LOAD_TIME, (uintptr_t)&dd);
+		if (res)
+			return;
+
+		dd.d_idx = 1;
+		dd.d_cnt = 1;
+		dd.frac = 0;
+		dd.sec = 4100 + 2 * i + 1;
+		res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_LOAD_TIME, (uintptr_t)&dd);
+		if (res)
+			return;
+	}
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_PPSDO_CTRL, XTRXLL_PPSDO_INT_GPS);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_SETCMP, 25999972);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GTIME_CTRL,
+						   internal ? XTRXLL_GTIME_INT_ISO : XTRXLL_GTIME_EXT_PPSFW);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_ISOPPS_CTRL, XTRXLL_GISO_PPSFW);
+	if (res)
+		return;
+
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_ISOPPS_SETTIME, 4096);
+	if (res)
+		return;
+
+
+	for (unsigned i = 0; i < 640000; i++) {
+		int a[2],c,d;
+
+		res = xtrxll_get_sensor(dev, XTRXLL_GTIME_SECFRAC, &a[0]);
+		if (res)
+			return;
+		res = xtrxll_get_sensor(dev, XTRXLL_GTIME_OFF, &c);
+		if (res)
+			return;
+		res = xtrxll_get_sensor(dev, XTRXLL_OSC_LATCHED, &d);
+
+		printf("%06d.%08d => %09d  [%02d] %c   %08d\n", a[0],a[1],c & 0x7fffff,
+			   (unsigned)c >> 28, ((c >> 27)& 1) ? 'Y' : 'N', d);
+		sleep(1);
+
+	}
+}
+
+#if 0
+int octo_lo_spi(struct xtrxll_dev *dev, uint32_t out)
+{
+	int res;
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_EXT_SPI,
+						   0x10000000 | (out & 0x0fffffff));
+	if (res)
+		return res;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_EXT_SPI,
+						   0x20000000 | (out >> 28));
+	if (res)
+		return res;
+
+	usleep(150000);
+	return 0;
+}
+
+int octo_tune(struct xtrxll_dev* dev)
+{
+	uint32_t tregs[] = {
+		0x1041C,
+		0x61300B,
+		0xC00C3A,
+		0x8083CC9,
+		0x102D0428,
+		0x120000E7,
+		0x3500A3F6,
+		0x800025,
+		0x30008B84,
+		0x3,
+		0x80032,
+		0x4AAAAA1,
+		0x200B60,
+
+		0x00C00C3A,
+		0x3500A3F6,
+		0x30008B84 | 0x10,
+		0x00080032,
+		0x04AAAAA1,
+		0x00000B60,
+		0x30008B84,
+
+		0x200B60
+	};
+
+	for (unsigned i = 0; i < sizeof(tregs)/sizeof(tregs[0]); i++) {
+		fprintf(stderr, "=== %08x\n", tregs[i]);
+		int res = octo_lo_spi(dev, tregs[i]);
+		if (res) {
+			return res;
+		}
+		usleep(5000);
+	}
+	return 0;
+}
+#endif
+
+
+void do_octotest(struct xtrxll_dev *dev)
+{
+	int res;
+	int oval;
+
+	// Set
+	// gpio_spi_sck, gpio_spi_sen, gpio_spi_mosi,
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_FUNC, (1 << 20) | (0 << 18) | (1 << 16));
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_GPIO_DIR, 0);
+	if (res)
+		return;
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_EXT_SPI, 0x80000000);
+	if (res)
+		return;
+
+	usleep(20000);
+
+	res = xtrxll_get_sensor(dev, XTRXLL_EXT_SPI_RB, &oval);
+	if (res)
+		return;
+
+	printf("GOT: %08x\n", oval);
+
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_EXT_SPI, 0x000001ff);
+	if (res)
+		return;
+
+	//octo_tune(dev);
+	sleep(100);
+
+	printf("SHUTDOWN\n");
+
+	res = xtrxll_set_param(dev, XTRXLL_PARAM_EXT_SPI, 0x00000000);
+	if (res)
+		return;
+}
 
 int main(int argc, char** argv)
 {
@@ -394,7 +620,7 @@ int main(int argc, char** argv)
 	int num_lms7;
 	uint32_t i;
 	int opt;
-	const char* device = "/dev/xtrx0";
+	const char* device = NULL;
 	int powerdown = 0;
 	int temp_sensor = -1;
 	int rxdma = -1;
@@ -421,6 +647,9 @@ int main(int argc, char** argv)
 	int discovery = 0;
 	int mmcm_tx = 1;
 	int vio = -1;
+	int ledtest = 0;
+	int synctest = 0;
+	int octotest = 0;
 
 	pthread_t out_thread, in_thread;
 #ifdef __linux
@@ -432,8 +661,17 @@ int main(int argc, char** argv)
 	sem_init(&g_in_buff_available, 0, 0);
 	sem_init(&g_in_buff_ready, 0, 0);
 
-	while ((opt = getopt(argc, argv, "dF:fU:C:Z:21A:a:oD:PRT:r:m:vO:I:l:p:SV:")) != -1) {
+	while ((opt = getopt(argc, argv, "EYdF:fU:C:Z:21A:a:oD:PRT:r:m:vO:I:l:p:SV:L")) != -1) {
 		switch (opt) {
+		case 'E':
+			octotest = 1;
+			break;
+		case 'Y':
+			synctest = 1;
+			break;
+		case 'L':
+			ledtest = 1;
+			break;
 		case 'd':
 			discovery = 1;
 			break;
@@ -567,6 +805,14 @@ int main(int argc, char** argv)
 		usleep(10000);
 	}
 
+	if (synctest) {
+		do_synctest(dev, synctest == 1);
+	}
+
+	if (octotest) {
+		do_octotest(dev);
+	}
+
 	if (lf) {
 		int osc;
 		res = xtrxll_get_sensor(dev, XTRXLL_OSC_LATCHED, &osc);
@@ -579,6 +825,8 @@ int main(int argc, char** argv)
 		if (temp_sensor > 2)
 			temp_sensor = 2;
 		int val;
+
+		usleep(50000);
 		res = xtrxll_get_sensor(dev, XTRXLL_TEMP_SENSOR_CUR + temp_sensor, &val);
 		if (!res) {
 			printf("Temp [%d]: %0.2fC (%04x)\n",
@@ -595,6 +843,10 @@ int main(int argc, char** argv)
 		if (!res) {
 			printf("PMIC: %08x\n", val);
 		}
+	}
+
+	if (ledtest) {
+		do_ledtest(dev, ledtest);
 	}
 
 	if (refclk_cntr) {
